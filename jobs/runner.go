@@ -58,7 +58,6 @@ func NewRunner(opts NewRunnerOpts) *Runner {
 		log:           opts.Log,
 		pollInterval:  opts.PollInterval,
 		queue:         opts.Queue,
-		drain:         make(chan struct{}),
 	}
 }
 
@@ -71,8 +70,9 @@ type Runner struct {
 	log           logger
 	pollInterval  time.Duration
 	queue         *goqite.Queue
-	drain         chan struct{}
 	cancel        context.CancelFunc
+	rCtx          context.Context
+	rCancel       context.CancelFunc
 	wg            sync.WaitGroup
 }
 
@@ -93,33 +93,31 @@ func (r *Runner) Start(ctx context.Context) {
 	r.log.Info("Starting job runner", "jobs", names)
 
 	ctx, r.cancel = context.WithCancel(ctx)
+	r.rCtx, r.rCancel = context.WithCancel(context.Background())
+
 	defer r.cancel()
 
 	for {
 		select {
-		case <-r.drain:
+		case <-r.rCtx.Done():
 			r.log.Info("Draining job runner")
 			r.wg.Wait()
 			r.log.Info("Job runner drained")
 			return
 		case <-ctx.Done():
+			r.rCancel()
 			r.log.Info("Stopping job runner")
 			r.wg.Wait()
 			r.log.Info("Stopped job runner")
 			return
 		default:
-			r.receiveAndRun(ctx, &r.wg)
+			r.receiveAndRun(ctx, r.rCtx, &r.wg)
 		}
 	}
 }
 
 func (r *Runner) Drain(ctx context.Context) {
-	select {
-	case r.drain <- struct{}{}:
-	case <-ctx.Done():
-		r.cancel()
-		return
-	}
+	r.rCancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -136,7 +134,7 @@ func (r *Runner) Drain(ctx context.Context) {
 	}
 }
 
-func (r *Runner) receiveAndRun(ctx context.Context, wg *sync.WaitGroup) {
+func (r *Runner) receiveAndRun(ctx context.Context, receiveCtx context.Context, wg *sync.WaitGroup) {
 	r.jobCountLock.RLock()
 	if r.jobCount == r.jobCountLimit {
 		r.jobCountLock.RUnlock()
@@ -147,7 +145,7 @@ func (r *Runner) receiveAndRun(ctx context.Context, wg *sync.WaitGroup) {
 		r.jobCountLock.RUnlock()
 	}
 
-	m, err := r.queue.ReceiveAndWait(ctx, r.pollInterval)
+	m, err := r.queue.ReceiveAndWait(receiveCtx, r.pollInterval)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return
