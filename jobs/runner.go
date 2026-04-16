@@ -58,6 +58,7 @@ func NewRunner(opts NewRunnerOpts) *Runner {
 		log:           opts.Log,
 		pollInterval:  opts.PollInterval,
 		queue:         opts.Queue,
+		drain:         make(chan struct{}),
 	}
 }
 
@@ -70,6 +71,9 @@ type Runner struct {
 	log           logger
 	pollInterval  time.Duration
 	queue         *goqite.Queue
+	drain         chan struct{}
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 type message struct {
@@ -88,18 +92,47 @@ func (r *Runner) Start(ctx context.Context) {
 
 	r.log.Info("Starting job runner", "jobs", names)
 
-	var wg sync.WaitGroup
+	ctx, r.cancel = context.WithCancel(ctx)
+	defer r.cancel()
 
 	for {
 		select {
+		case <-r.drain:
+			r.log.Info("Draining job runner")
+			r.wg.Wait()
+			r.log.Info("Job runner drained")
+			return
 		case <-ctx.Done():
 			r.log.Info("Stopping job runner")
-			wg.Wait()
+			r.wg.Wait()
 			r.log.Info("Stopped job runner")
 			return
 		default:
-			r.receiveAndRun(ctx, &wg)
+			r.receiveAndRun(ctx, &r.wg)
 		}
+	}
+}
+
+func (r *Runner) Drain(ctx context.Context) {
+	select {
+	case r.drain <- struct{}{}:
+	case <-ctx.Done():
+		r.cancel()
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.wg.Wait()
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+		r.cancel()
+		<-done
 	}
 }
 
